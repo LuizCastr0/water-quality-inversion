@@ -1,0 +1,23 @@
+# dados de treino e teste
+track2_download_link_1/
+track2_download_link_2/
+track2_download_link_3/
+track2_download_link_4/
+track2_download_link_5/
+
+# modelos pytorch (não usados na inferência)
+models/*.pth
+
+# outputs locais
+test_output/
+
+# utilitários locais
+python_tree.py
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+.ipynb_checkpoints/
