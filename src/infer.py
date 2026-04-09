@@ -59,9 +59,60 @@ def get_fallback(target: str, month: int) -> float:
     return CHA_MEDIAN_BY_MONTH.get(month, CHA_GLOBAL_MEDIAN)
 
 
-def predict_csv(csv_path: Path, img_dir: Path, model,
-                target: str) -> dict:
-    df     = pd.read_csv(csv_path)
+def extract_month(fname: str) -> int:
+    match = re.search(r'(\d{4})-(\d{2})-(\d{2})', fname)
+    return int(match.group(2)) if match else 6
+
+
+def make_key(row) -> str:
+    return f"{row['filename']}_{row['Lon']}_{row['Lat']}"
+
+
+def apply_fallback(result: dict, rows, target: str, month: int):
+    value = round(get_fallback(target, month), 4)
+    for row in rows:
+        result[make_key(row)] = [value]
+
+
+def process_row(src, row, model, month, h, w, target):
+    key = make_key(row)
+    py, px = src.index(row['Lon'], row['Lat'])
+
+    if py < HALF or py >= h - HALF or px < HALF or px >= w - HALF:
+        return key, get_fallback(target, month)
+
+    window = rasterio.windows.Window(px - HALF, py - HALF, PATCH_SIZE, PATCH_SIZE)
+    patch = src.read(window=window).astype(np.float32)
+
+    if patch.shape != (N_BANDS, PATCH_SIZE, PATCH_SIZE):
+        return key, get_fallback(target, month)
+
+    feats = extract_features(patch, month)
+    log_pred = model.predict(feats.reshape(1, -1))[0]
+
+    return key, float(np.expm1(log_pred))
+
+
+def process_file(tif: Path, rows, model, target: str, month: int, result: dict):
+    if not tif.exists():
+        apply_fallback(result, rows, target, month)
+        return
+
+    try:
+        with rasterio.open(tif) as src:
+            h, w = src.shape
+
+            for row in rows:
+                key, value = process_row(src, row, model, month, h, w, target)
+                result[key] = [round(value, 4)]
+
+    except Exception as e:
+        print(f"  erro em {tif.name}: {e}")
+        apply_fallback(result, rows, target, month)
+
+
+def predict_csv(csv_path: Path, img_dir: Path, model, target: str) -> dict:
+    df = pd.read_csv(csv_path)
     result = {}
 
     rows_by_file = defaultdict(list)
@@ -69,44 +120,10 @@ def predict_csv(csv_path: Path, img_dir: Path, model,
         rows_by_file[row['filename']].append(row)
 
     for fname, rows in rows_by_file.items():
-        tif   = img_dir / fname
-        match = re.search(r'(\d{4})-(\d{2})-(\d{2})', fname)
-        month = int(match.group(2)) if match else 6
+        tif = img_dir / fname
+        month = extract_month(fname)
 
-        if not tif.exists():
-            for row in rows:
-                key = f"{row['filename']}_{row['Lon']}_{row['Lat']}"
-                result[key] = [round(get_fallback(target, month), 4)]
-            continue
-
-        try:
-            with rasterio.open(tif) as src:
-                h, w = src.shape
-                for row in rows:
-                    key = f"{row['filename']}_{row['Lon']}_{row['Lat']}"
-                    py, px = src.index(row['Lon'], row['Lat'])
-
-                    if py < HALF or py >= h - HALF or px < HALF or px >= w - HALF:
-                        result[key] = [round(get_fallback(target, month), 4)]
-                        continue
-
-                    window = rasterio.windows.Window(
-                        px - HALF, py - HALF, PATCH_SIZE, PATCH_SIZE)
-                    patch = src.read(window=window).astype(np.float32)
-
-                    if patch.shape != (N_BANDS, PATCH_SIZE, PATCH_SIZE):
-                        result[key] = [round(get_fallback(target, month), 4)]
-                        continue
-
-                    feats    = extract_features(patch, month)
-                    log_pred = model.predict(feats.reshape(1, -1))[0]
-                    result[key] = [round(float(np.expm1(log_pred)), 4)]
-
-        except Exception as e:
-            print(f"  erro em {fname}: {e}")
-            for row in rows:
-                key = f"{row['filename']}_{row['Lon']}_{row['Lat']}"
-                result[key] = [round(get_fallback(target, month), 4)]
+        process_file(tif, rows, model, target, month, result)
 
     return result
 
