@@ -14,7 +14,7 @@ INPUT_DIR  = Path('/input')
 # lê OUTPUT_DIR da variável de ambiente injetada pelo container da plataforma;
 # fallback para /output para manter compatibilidade com testes locais
 OUTPUT_DIR = Path(os.environ.get('OUTPUT_DIR', '/output'))
-MODEL_DIR  = Path('/workspace/models')
+MODEL_DIR  = Path('/app/models')
 
 TURB_MEDIAN_BY_MONTH = {
     1: 7.10, 2: 6.20, 3: 12.60, 4: 31.60, 5: 32.60,
