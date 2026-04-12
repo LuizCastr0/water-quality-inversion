@@ -12,19 +12,19 @@ COPY requirements.txt .
 
 # 安装依赖
 # 使用华为云镜像源以加快在中国服务器上的下载速度
+# ... (Mantenha o topo igual até o pip install)
 RUN pip install --cache-dir /tmp/pip-cache -r requirements.txt -i https://repo.huaweicloud.com/repository/pypi/simple
 
-# 复制项目的所有文件到容器的 /app 目录下
+# 1. Primeiro, copia TUDO para o container
 COPY . .
 
-# --- 关键修正部分 ---
+# 2. MOVE ou COPIA o conteúdo de src para a raiz (/app)
+# Isso garante que train.py e infer.py fiquem em /app/train.py
+RUN cp -r src/* .
 
-# 1. 设置环境变量，让 Python 能够识别 src 文件夹中的模块
-# 这样即使你在 /app 下运行，也能正确执行 'import dataset' 等操作
-ENV PYTHONPATH="${PYTHONPATH}:/app/src"
+# 3. Mantém o PYTHONPATH por segurança para imports internos
+ENV PYTHONPATH="${PYTHONPATH}:/app"
 ENV PYTHONUNBUFFERED=1
 
-# 2. 修正启动命令：
-# 删除了 Flask 相关配置，改为直接运行你的训练脚本
-# 由于你的文件在 src/ 下，路径必须写成 src/train.py
-CMD ["python", "src/train.py"]
+# O CMD aqui é uma redundância, o servidor vai usar o startCmd dele
+CMD ["python", "train.py"]
