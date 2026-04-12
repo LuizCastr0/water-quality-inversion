@@ -1,4 +1,4 @@
-# infer.py — fase2/src/infer.py
+# infer.py
 import json
 import os
 import re
@@ -11,8 +11,6 @@ from collections import defaultdict
 from dataset import compute_indices, HALF, N_BANDS, PATCH_SIZE
 
 INPUT_DIR  = Path('/input')
-# lê OUTPUT_DIR da variável de ambiente injetada pelo container da plataforma;
-# fallback para /output para manter compatibilidade com testes locais
 OUTPUT_DIR = Path(os.environ.get('OUTPUT_DIR', '/output'))
 MODEL_DIR  = Path('/app/models')
 
@@ -35,13 +33,18 @@ def get_fallback(target: str, month: int) -> float:
     return CHA_MEDIAN_BY_MONTH.get(month, CHA_GLOBAL_MEDIAN)
 
 
-def extract_features(patch: np.ndarray, month: int) -> np.ndarray:
+def extract_features_full(patch: np.ndarray, month: int) -> np.ndarray:
+    """
+    Extrai o vetor COMPLETO de 65 features.
+    A selecao SHAP é aplicada depois, usando os indices salvos no bundle.
+    Isso garante consistência total entre treino e inferência.
+    """
     b   = patch[:, HALF, HALF]
     eps = 1e-6
 
     indices = compute_indices(patch)
 
-    ratios = np.array([
+    ratios_orig = np.array([
         b[0] / (b[1] + eps),
         b[2] / (b[1] + eps),
         b[3] / (b[2] + eps),
@@ -50,17 +53,41 @@ def extract_features(patch: np.ndarray, month: int) -> np.ndarray:
         b[4] / (b[2] + eps),
     ], dtype=np.float32)
 
-    spatial      = patch.reshape(N_BANDS, -1).std(-1)
-    spatial_mean = patch.reshape(N_BANDS, -1).mean(-1)
+    ratios_new = np.array([
+        b[8] / (b[1] + eps),
+        b[9] / (b[1] + eps),
+        b[4] / (b[3] + eps),
+        b[8] / (b[2] + eps),
+    ], dtype=np.float32)
+
+    flat         = patch.reshape(N_BANDS, -1)
+    spatial_std  = flat.std(-1)
+    spatial_mean = flat.mean(-1)
+    spatial_cv   = np.clip(
+        spatial_std / (spatial_mean + eps), 0, 5
+    ).astype(np.float32)
 
     month_sin = np.float32(np.sin(2 * np.pi * month / 12))
     month_cos = np.float32(np.cos(2 * np.pi * month / 12))
 
-    return np.concatenate([b, indices, ratios, spatial, spatial_mean,
-                           [month_sin, month_cos]])
+    return np.concatenate([
+        b, indices, ratios_orig, ratios_new,
+        spatial_std, spatial_mean, spatial_cv,
+        [month_sin, month_cos],
+    ])
 
 
-def predict_csv(csv_path: Path, img_dir: Path, model,
+def load_bundle(path: Path) -> tuple:
+    """
+    Carrega o bundle {modelo + indices SHAP} salvo pelo train.py.
+    Retorna (model, selected_idx) para ser usado na inferência.
+    """
+    bundle = joblib.load(path)
+    return bundle['model'], bundle['selected_idx']
+
+
+def predict_csv(csv_path: Path, img_dir: Path,
+                model, selected_idx: list[int],
                 target: str) -> dict:
     df     = pd.read_csv(csv_path)
     result = {}
@@ -99,8 +126,11 @@ def predict_csv(csv_path: Path, img_dir: Path, model,
                         result[key] = [round(get_fallback(target, month), 4)]
                         continue
 
-                    feats    = extract_features(patch, month)
-                    log_pred = model.predict(feats.reshape(1, -1))[0]
+                    # extrai todas as 65 features e aplica selecao SHAP
+                    feats_full = extract_features_full(patch, month)
+                    feats_sel  = feats_full[selected_idx]
+
+                    log_pred   = model.predict(feats_sel.reshape(1, -1))[0]
                     result[key] = [round(float(np.expm1(log_pred)), 4)]
 
         except Exception as e:
@@ -116,14 +146,18 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"OUTPUT_DIR: {OUTPUT_DIR}")
 
-    img_dir    = INPUT_DIR / 'area8_images'
-    model_turb = joblib.load(MODEL_DIR / 'model_turb.joblib')
-    model_cha  = joblib.load(MODEL_DIR / 'model_cha.joblib')
+    img_dir = INPUT_DIR / 'area8_images'
+
+    model_turb, idx_turb = load_bundle(MODEL_DIR / 'model_turb.joblib')
+    model_cha,  idx_cha  = load_bundle(MODEL_DIR / 'model_cha.joblib')
+
+    print(f"turb: {len(idx_turb)} features selecionadas")
+    print(f"cha : {len(idx_cha)} features selecionadas")
 
     turb = predict_csv(INPUT_DIR / 'track2_turb_test_point.csv',
-                       img_dir, model_turb, 'turb')
+                       img_dir, model_turb, idx_turb, 'turb')
     cha  = predict_csv(INPUT_DIR / 'track2_cha_test_point.csv',
-                       img_dir, model_cha,  'cha')
+                       img_dir, model_cha,  idx_cha,  'cha')
 
     with open(OUTPUT_DIR / 'result_turbidity.json', 'w') as f:
         json.dump(turb, f, indent=2)
