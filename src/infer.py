@@ -9,11 +9,13 @@ import rasterio
 from pathlib import Path
 from collections import defaultdict
 from dataset import compute_indices, HALF, N_BANDS, PATCH_SIZE
+from qaa import compute_iops_from_patch   # necessário para o modelo híbrido
 
 INPUT_DIR  = Path('/input')
 OUTPUT_DIR = Path(os.environ.get('OUTPUT_DIR', '/output'))
-MODEL_DIR  = Path('/app/models')
+MODEL_DIR  = Path('/workspace/models')    # ajuste conforme seu Dockerfile
 
+# ========== Fallback values (em escala original) ==========
 TURB_MEDIAN_BY_MONTH = {
     1: 7.10, 2: 6.20, 3: 12.60, 4: 31.60, 5: 32.60,
     6: 17.40, 7: 10.30, 8: 16.45, 9: 9.00,
@@ -26,70 +28,73 @@ CHA_MEDIAN_BY_MONTH = {
 }
 CHA_GLOBAL_MEDIAN = 8.30
 
-
-def get_fallback(target: str, month: int) -> float:
+def get_fallback_log(target: str, month: int) -> float:
+    """Retorna o valor de fallback em escala log1p."""
     if target == 'turb':
-        return TURB_MEDIAN_BY_MONTH.get(month, TURB_GLOBAL_MEDIAN)
-    return CHA_MEDIAN_BY_MONTH.get(month, CHA_GLOBAL_MEDIAN)
+        raw = TURB_MEDIAN_BY_MONTH.get(month, TURB_GLOBAL_MEDIAN)
+    else:
+        raw = CHA_MEDIAN_BY_MONTH.get(month, CHA_GLOBAL_MEDIAN)
+    return np.log1p(raw)
 
-
-def extract_features_full(patch: np.ndarray, month: int) -> np.ndarray:
-    """
-    Extrai o vetor COMPLETO de 65 features.
-    A selecao SHAP é aplicada depois, usando os indices salvos no bundle.
-    Isso garante consistência total entre treino e inferência.
-    """
-    b   = patch[:, HALF, HALF]
+# ========== Extração de features para o modelo original (65 features) ==========
+def extract_features_original(patch: np.ndarray, month: int) -> np.ndarray:
+    b = patch[:, HALF, HALF]
     eps = 1e-6
-
     indices = compute_indices(patch)
 
     ratios_orig = np.array([
-        b[0] / (b[1] + eps),
-        b[2] / (b[1] + eps),
-        b[3] / (b[2] + eps),
-        b[8] / (b[1] + eps),
-        b[8] / (b[3] + eps),
-        b[4] / (b[2] + eps),
+        b[0] / (b[1] + eps), b[2] / (b[1] + eps), b[3] / (b[2] + eps),
+        b[8] / (b[1] + eps), b[8] / (b[3] + eps), b[4] / (b[2] + eps),
     ], dtype=np.float32)
 
     ratios_new = np.array([
-        b[8] / (b[1] + eps),
-        b[9] / (b[1] + eps),
-        b[4] / (b[3] + eps),
-        b[8] / (b[2] + eps),
+        b[8] / (b[1] + eps), b[9] / (b[1] + eps),
+        b[4] / (b[3] + eps), b[8] / (b[2] + eps),
     ], dtype=np.float32)
 
-    flat         = patch.reshape(N_BANDS, -1)
-    spatial_std  = flat.std(-1)
+    flat = patch.reshape(N_BANDS, -1)
+    spatial_std = flat.std(-1)
     spatial_mean = flat.mean(-1)
-    spatial_cv   = np.clip(
-        spatial_std / (spatial_mean + eps), 0, 5
-    ).astype(np.float32)
+    spatial_cv = np.clip(spatial_std / (spatial_mean + eps), 0, 5).astype(np.float32)
 
-    month_sin = np.float32(np.sin(2 * np.pi * month / 12))
-    month_cos = np.float32(np.cos(2 * np.pi * month / 12))
+    month_sin = np.sin(2 * np.pi * month / 12)
+    month_cos = np.cos(2 * np.pi * month / 12)
 
-    return np.concatenate([
+    feats = np.concatenate([
         b, indices, ratios_orig, ratios_new,
         spatial_std, spatial_mean, spatial_cv,
-        [month_sin, month_cos],
+        [month_sin, month_cos]
     ])
+    return feats.astype(np.float32)
 
+# ========== Extração de features para o modelo híbrido (QAA) ==========
+# Mapeamento das bandas Sentinel-2 (ajuste conforme seus dados)
+BAND_IDX = {'blue': 1, 'green': 2, 'red': 3}   # exemplo: B2, B3, B4 nas posições 1,2,3
 
-def load_bundle(path: Path) -> tuple:
-    """
-    Carrega o bundle {modelo + indices SHAP} salvo pelo train.py.
-    Retorna (model, selected_idx) para ser usado na inferência.
-    """
+def extract_features_hybrid(patch: np.ndarray, month: int) -> np.ndarray:
+    iops = compute_iops_from_patch(patch, BAND_IDX)
+    feats = [
+        iops['a_blue'], iops['a_green'], iops['a_red'],
+        iops['bb_blue'], iops['bb_green'], iops['bb_red'],
+        iops['ratio_bb_a_blue'], iops['ratio_bb_a_green'], iops['slope_gamma'],
+    ]
+    month_sin = np.sin(2 * np.pi * month / 12)
+    month_cos = np.cos(2 * np.pi * month / 12)
+    feats.extend([month_sin, month_cos])
+    return np.array(feats, dtype=np.float32)
+
+# ========== Carregamento do bundle ==========
+def load_bundle(path: Path):
     bundle = joblib.load(path)
-    return bundle['model'], bundle['selected_idx']
+    model = bundle['model']
+    selected_idx = bundle.get('selected_idx', list(range(bundle.get('n_features_in', 1))))
+    is_hybrid = bundle.get('hybrid', False)
+    return model, selected_idx, is_hybrid
 
-
-def predict_csv(csv_path: Path, img_dir: Path,
-                model, selected_idx: list[int],
-                target: str) -> dict:
-    df     = pd.read_csv(csv_path)
+# ========== Predição para um arquivo CSV ==========
+def predict_csv(csv_path: Path, img_dir: Path, model, selected_idx: list[int],
+                target: str, is_hybrid: bool) -> dict:
+    df = pd.read_csv(csv_path)
     result = {}
 
     rows_by_file = defaultdict(list)
@@ -97,14 +102,16 @@ def predict_csv(csv_path: Path, img_dir: Path,
         rows_by_file[row['filename']].append(row)
 
     for fname, rows in rows_by_file.items():
-        tif   = img_dir / fname
+        tif = img_dir / fname
         match = re.search(r'(\d{4})-(\d{2})-(\d{2})', fname)
         month = int(match.group(2)) if match else 6
 
+        # Fallback se o arquivo não existir
         if not tif.exists():
             for row in rows:
                 key = f"{row['filename']}_{row['Lon']}_{row['Lat']}"
-                result[key] = [round(get_fallback(target, month), 4)]
+                log_pred = get_fallback_log(target, month)
+                result[key] = [round(float(np.expm1(log_pred)), 4)]
             continue
 
         try:
@@ -115,7 +122,8 @@ def predict_csv(csv_path: Path, img_dir: Path,
                     py, px = src.index(row['Lon'], row['Lat'])
 
                     if py < HALF or py >= h - HALF or px < HALF or px >= w - HALF:
-                        result[key] = [round(get_fallback(target, month), 4)]
+                        log_pred = get_fallback_log(target, month)
+                        result[key] = [round(float(np.expm1(log_pred)), 4)]
                         continue
 
                     window = rasterio.windows.Window(
@@ -123,41 +131,50 @@ def predict_csv(csv_path: Path, img_dir: Path,
                     patch = src.read(window=window).astype(np.float32)
 
                     if patch.shape != (N_BANDS, PATCH_SIZE, PATCH_SIZE):
-                        result[key] = [round(get_fallback(target, month), 4)]
+                        log_pred = get_fallback_log(target, month)
+                        result[key] = [round(float(np.expm1(log_pred)), 4)]
                         continue
 
-                    # extrai todas as 65 features e aplica selecao SHAP
-                    feats_full = extract_features_full(patch, month)
-                    feats_sel  = feats_full[selected_idx]
+                    # Escolhe a função de extração conforme o tipo de modelo
+                    if is_hybrid:
+                        feats_full = extract_features_hybrid(patch, month)
+                    else:
+                        feats_full = extract_features_original(patch, month)
 
-                    log_pred   = model.predict(feats_sel.reshape(1, -1))[0]
+                    feats_sel = feats_full[selected_idx]
+                    log_pred = model.predict(feats_sel.reshape(1, -1))[0]
                     result[key] = [round(float(np.expm1(log_pred)), 4)]
 
         except Exception as e:
             print(f"  erro em {fname}: {e}")
             for row in rows:
                 key = f"{row['filename']}_{row['Lon']}_{row['Lat']}"
-                result[key] = [round(get_fallback(target, month), 4)]
+                log_pred = get_fallback_log(target, month)
+                result[key] = [round(float(np.expm1(log_pred)), 4)]
 
     return result
 
-
+# ========== Main ==========
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"OUTPUT_DIR: {OUTPUT_DIR}")
 
     img_dir = INPUT_DIR / 'area8_images'
 
-    model_turb, idx_turb = load_bundle(MODEL_DIR / 'model_turb.joblib')
-    model_cha,  idx_cha  = load_bundle(MODEL_DIR / 'model_cha.joblib')
+    # Carrega os modelos (assumindo que ambos são do mesmo tipo)
+    model_turb, idx_turb, hybrid_turb = load_bundle(MODEL_DIR / 'model_turb.joblib')
+    model_cha,  idx_cha,  hybrid_cha  = load_bundle(MODEL_DIR / 'model_cha.joblib')
 
-    print(f"turb: {len(idx_turb)} features selecionadas")
-    print(f"cha : {len(idx_cha)} features selecionadas")
+    print(f"Turbidez - modelo híbrido: {hybrid_turb}, features: {len(idx_turb)}")
+    print(f"Clorofila - modelo híbrido: {hybrid_cha}, features: {len(idx_cha)}")
+
+    # Para segurança, usa o tipo do modelo de turbidez (ambos devem ser iguais)
+    is_hybrid = hybrid_turb
 
     turb = predict_csv(INPUT_DIR / 'track2_turb_test_point.csv',
-                       img_dir, model_turb, idx_turb, 'turb')
+                       img_dir, model_turb, idx_turb, 'turb', is_hybrid)
     cha  = predict_csv(INPUT_DIR / 'track2_cha_test_point.csv',
-                       img_dir, model_cha,  idx_cha,  'cha')
+                       img_dir, model_cha, idx_cha, 'cha', is_hybrid)
 
     with open(OUTPUT_DIR / 'result_turbidity.json', 'w') as f:
         json.dump(turb, f, indent=2)
@@ -167,7 +184,6 @@ def main():
     print(f"turbidez : {len(turb)} pontos")
     print(f"chl-a    : {len(cha)} pontos")
     print(f"arquivos escritos em: {OUTPUT_DIR}")
-
 
 if __name__ == '__main__':
     main()
